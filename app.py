@@ -14,6 +14,92 @@ from rdkit.Chem.rdchem import BondType
 
 app = Flask(__name__)
 CORS(app)
+import re
+import requests
+
+PUBCHEM = "https://pubchem.ncbi.nlm.nih.gov/rest/pug"
+
+def _pc_json(url, timeout=10):
+    r = requests.get(url, headers={"Accept": "application/json"}, timeout=timeout)
+    r.raise_for_status()
+    js = r.json()
+    # PubChem sometimes returns 200 with a Fault payload
+    fault = js.get("Fault")
+    if fault:
+        details = fault.get("Details") or []
+        msg = details[0] if details else fault.get("Message", "PubChem fault")
+        raise ValueError(str(msg))
+    return js
+
+def _props_smiles_from_properties(js):
+    p = (js.get("PropertyTable") or {}).get("Properties") or []
+    if not p:
+        return None
+    p = p[0]
+    return p.get("IsomericSMILES") or p.get("CanonicalSMILES")
+
+@app.post("/api/resolve_name")
+def api_resolve_name():
+    """
+    Input JSON: {"query": "<name | CAS | InChIKey>"}
+    Output JSON: {"smiles": "..."}  (400 on failure)
+    """
+    data = request.get_json(force=True)
+    q = (data.get("query") or "").strip()
+    if not q:
+        return jsonify({"error": "missing query"}), 400
+
+    enc = requests.utils.quote(q, safe="")
+    is_inchikey = re.match(r"^[A-Z]{14}-[A-Z]{10}-[A-Z]$", q, flags=re.I) is not None
+    is_cas      = re.match(r"^\d{2,7}-\d{2}-\d$", q) is not None
+
+    try:
+        # 1) InChIKey → SMILES
+        if is_inchikey:
+            js = _pc_json(f"{PUBCHEM}/compound/inchikey/{enc}/property/IsomericSMILES,CanonicalSMILES/JSON")
+            smi = _props_smiles_from_properties(js)
+            if smi: return jsonify({"smiles": smi})
+            return jsonify({"error": "no SMILES for that InChIKey"}), 404
+
+        # 2) CAS → (properties | CID → properties)
+        if is_cas:
+            try:
+                js = _pc_json(f"{PUBCHEM}/compound/xref/rn/{enc}/property/IsomericSMILES,CanonicalSMILES/JSON")
+                smi = _props_smiles_from_properties(js)
+                if smi: return jsonify({"smiles": smi})
+            except Exception:
+                pass
+            cj = _pc_json(f"{PUBCHEM}/compound/xref/rn/{enc}/cids/JSON")
+            cids = ((cj.get("IdentifierList") or {}).get("CID") or [])
+            if cids:
+                cid = cids[0]
+                pj = _pc_json(f"{PUBCHEM}/compound/cid/{cid}/property/IsomericSMILES,CanonicalSMILES/JSON")
+                smi = _props_smiles_from_properties(pj)
+                if smi: return jsonify({"smiles": smi})
+            return jsonify({"error": "no SMILES for that CAS"}), 404
+
+        # 3) Name → (properties | CID → properties)
+        try:
+            js = _pc_json(f"{PUBCHEM}/compound/name/{enc}/property/IsomericSMILES,CanonicalSMILES/JSON")
+            smi = _props_smiles_from_properties(js)
+            if smi: return jsonify({"smiles": smi})
+        except Exception:
+            pass
+
+        cj = _pc_json(f"{PUBCHEM}/compound/name/{enc}/cids/JSON")
+        cids = ((cj.get("IdentifierList") or {}).get("CID") or [])
+        if cids:
+            cid = cids[0]
+            pj = _pc_json(f"{PUBCHEM}/compound/cid/{cid}/property/IsomericSMILES,CanonicalSMILES/JSON")
+            smi = _props_smiles_from_properties(pj)
+            if smi: return jsonify({"smiles": smi})
+
+        return jsonify({"error": "could not resolve SMILES from that name"}), 404
+
+    except requests.HTTPError as e:
+        return jsonify({"error": f"HTTP {e.response.status_code} from PubChem"}), 502
+    except Exception as e:
+        return jsonify({"error": str(e)}), 400
 
 def gaussian_bond_order(bond) -> float:
     bt = bond.GetBondType()
@@ -144,5 +230,6 @@ def ok():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000)
+
 
 
