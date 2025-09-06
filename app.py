@@ -164,15 +164,31 @@ def resolve_query_to_smiles(q: str) -> str:
 
 # --------- Routes ----------
 # Accept both with and without trailing slash, and allow GET to avoid preflight.
-@app.route("/api/resolve_any", methods=["GET"], strict_slashes=False)
+# --------- Routes ----------
+# Accept GET/POST/OPTIONS and both with/without trailing slash
+@app.route("/api/resolve_any", methods=["GET", "POST", "OPTIONS"], strict_slashes=False)
+@app.route("/api/resolve_any/", methods=["GET", "POST", "OPTIONS"], strict_slashes=False)
 def api_resolve_any():
     """
     Resolve a query (SMILES or name/CAS/InChIKey) → SMILES
-    GET /api/resolve_any?query=...
+      GET  /api/resolve_any?query=...
+      POST /api/resolve_any    {"query":"..."}
     Returns: {"smiles": "..."} or 4xx on failure
     """
+    # Let Flask-CORS handle preflight, but return 200 explicitly too
+    if request.method == "OPTIONS":
+        return ("", 200)
+
     try:
-        q = (request.args.get("query") or "").strip()
+        if request.method == "GET":
+            q = (request.args.get("query") or "").strip()
+        else:  # POST
+            data = request.get_json(force=True, silent=True) or {}
+            q = (data.get("query") or "").strip()
+
+        if not q:
+            return jsonify({"error": "missing query"}), 422
+
         smi = resolve_query_to_smiles(q)
         return jsonify({"smiles": smi})
     except requests.HTTPError as e:
@@ -180,6 +196,7 @@ def api_resolve_any():
     except Exception as e:
         print("resolve_any error:", repr(e))
         return jsonify({"error": str(e)}), 404
+
 
 @app.post("/api/smiles2sdf")
 def api_smiles2sdf():
@@ -218,3 +235,4 @@ def ok():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000)
+
