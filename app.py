@@ -15,6 +15,7 @@ import re
 import requests
 
 app = Flask(__name__)
+# Be liberal with CORS on /api/*
 CORS(app, resources={r"/api/*": {"origins": "*"}})
 
 PUBCHEM = "https://pubchem.ncbi.nlm.nih.gov/rest/pug"
@@ -89,19 +90,15 @@ def build_connectivity_lines(mol) -> str:
 
 def format_gaussian(mol, title: str, header: str, include_conn: bool = True) -> str:
     conf = mol.GetConformer()
-    coords = []
-    for a in mol.GetAtoms():
-        idx = a.GetIdx()
-        pos = conf.GetAtomPosition(idx)
-        coords.append((a.GetSymbol(), pos.x, pos.y, pos.z))
-
     out = []
     if header:
         out.append(header.rstrip() + "\n\n")
     out.append(f"{title}\n\n")
     out.append("0 1\n")
-    for (sym, x, y, z) in coords:
-        out.append(f" {sym:<2} {x:>10.6f} {y:>10.6f} {z:>10.6f}\n")
+    for a in mol.GetAtoms():
+        idx = a.GetIdx()
+        pos = conf.GetAtomPosition(idx)
+        out.append(f" {a.GetSymbol():<2} {pos.x:>10.6f} {pos.y:>10.6f} {pos.z:>10.6f}\n")
     if include_conn:
         out.append("\n")
         out.append(build_connectivity_lines(mol))
@@ -113,26 +110,24 @@ def resolve_query_to_smiles(q: str) -> str:
     if not q:
         raise ValueError("missing query")
 
-    # 0) If it's valid SMILES already, canonicalize and return
+    # 0) Already SMILES?
     try:
         mol = Chem.MolFromSmiles(q)
         if mol is not None:
             return Chem.MolToSmiles(mol, isomericSmiles=True)
     except Exception:
-        pass  # not SMILES, fall through
+        pass
 
     enc = requests.utils.quote(q, safe="")
     is_inchikey = re.match(r"^[A-Z]{14}-[A-Z]{10}-[A-Z]$", q, flags=re.I) is not None
     is_cas      = re.match(r"^\d{2,7}-\d{2}-\d$", q) is not None
 
-    # 1) InChIKey
     if is_inchikey:
         js = _pc_json(f"{PUBCHEM}/compound/inchikey/{enc}/property/IsomericSMILES,CanonicalSMILES/JSON")
         smi = _props_smiles_from_properties(js)
         if smi: return smi
         raise ValueError("no SMILES for that InChIKey")
 
-    # 2) CAS RN
     if is_cas:
         try:
             js = _pc_json(f"{PUBCHEM}/compound/xref/rn/{enc}/property/IsomericSMILES,CanonicalSMILES/JSON")
@@ -149,7 +144,7 @@ def resolve_query_to_smiles(q: str) -> str:
             if smi: return smi
         raise ValueError("no SMILES for that CAS")
 
-    # 3) Name → property, else Name → CID → property
+    # Name
     try:
         js = _pc_json(f"{PUBCHEM}/compound/name/{enc}/property/IsomericSMILES,CanonicalSMILES/JSON")
         smi = _props_smiles_from_properties(js)
@@ -168,20 +163,16 @@ def resolve_query_to_smiles(q: str) -> str:
     raise ValueError("could not resolve SMILES from that name")
 
 # --------- Routes ----------
-@app.route("/api/resolve_any", methods=["POST", "GET", "OPTIONS"])
+# Accept both with and without trailing slash, and allow GET to avoid preflight.
+@app.route("/api/resolve_any", methods=["GET"], strict_slashes=False)
 def api_resolve_any():
     """
     Resolve a query (SMILES or name/CAS/InChIKey) → SMILES
-      POST JSON: {"query": "..."}
-      GET  ?query=...
+    GET /api/resolve_any?query=...
     Returns: {"smiles": "..."} or 4xx on failure
     """
     try:
-        if request.method == "GET":
-            q = (request.args.get("query") or "").strip()
-        else:
-            data = request.get_json(force=True, silent=True) or {}
-            q = (data.get("query") or "").strip()
+        q = (request.args.get("query") or "").strip()
         smi = resolve_query_to_smiles(q)
         return jsonify({"smiles": smi})
     except requests.HTTPError as e:
@@ -192,8 +183,8 @@ def api_resolve_any():
 
 @app.post("/api/smiles2sdf")
 def api_smiles2sdf():
-    data = request.get_json(force=True)
-    smiles = (data.get("smiles") or "").trim()
+    data = request.get_json(force=True) or {}
+    smiles = (data.get("smiles") or "").strip()    # <-- strip() (fixes .trim bug)
     if not smiles:
         return jsonify({"error": "Missing 'smiles'"}), 400
     try:
@@ -206,11 +197,11 @@ def api_smiles2sdf():
 
 @app.post("/api/gjf")
 def api_gjf():
-    data = request.get_json(force=True)
+    data = request.get_json(force=True) or {}
     smiles = (data.get("smiles") or "").strip()
     if not smiles:
         return jsonify({"error": "Missing 'smiles'"}), 400
-    header = data.get("header", "").strip()
+    header = (data.get("header") or "").strip()
     title  = data.get("title", smiles)
     include_conn = bool(data.get("include_connectivity", True))
     try:
