@@ -1,106 +1,43 @@
 # app.py
-# ChemWeaver backend: RDKit-powered SMILES → 3D SDF and Gaussian .gjf
+# ChemWeaver backend: resolve query→SMILES, build 3D SDF, build Gaussian .gjf
 #
 # Requirements:
-#   pip install flask flask-cors rdkit-pypi
+#   pip install flask flask-cors rdkit-pypi requests
 # Run:
-#   python app.py    (serves at http://127.0.0.1:5000)
+#   python app.py    (http://127.0.0.1:5000)
 
 from flask import Flask, request, jsonify, Response
 from flask_cors import CORS
 from rdkit import Chem
 from rdkit.Chem import AllChem
 from rdkit.Chem.rdchem import BondType
-
-app = Flask(__name__)
-CORS(app)
 import re
 import requests
 
+app = Flask(__name__)
+CORS(app, resources={r"/api/*": {"origins": "*"}})
+
 PUBCHEM = "https://pubchem.ncbi.nlm.nih.gov/rest/pug"
 
+# --------- PubChem helpers ----------
 def _pc_json(url, timeout=10):
     r = requests.get(url, headers={"Accept": "application/json"}, timeout=timeout)
     r.raise_for_status()
     js = r.json()
-    # PubChem sometimes returns 200 with a Fault payload
-    fault = js.get("Fault")
-    if fault:
-        details = fault.get("Details") or []
-        msg = details[0] if details else fault.get("Message", "PubChem fault")
+    if "Fault" in js:
+        det = js["Fault"].get("Details") or []
+        msg = det[0] if det else js["Fault"].get("Message", "PubChem fault")
         raise ValueError(str(msg))
     return js
 
 def _props_smiles_from_properties(js):
-    p = (js.get("PropertyTable") or {}).get("Properties") or []
-    if not p:
+    props = (js.get("PropertyTable") or {}).get("Properties") or []
+    if not props:
         return None
-    p = p[0]
+    p = props[0]
     return p.get("IsomericSMILES") or p.get("CanonicalSMILES")
 
-@app.post("/api/resolve_name")
-def api_resolve_name():
-    """
-    Input JSON: {"query": "<name | CAS | InChIKey>"}
-    Output JSON: {"smiles": "..."}  (400 on failure)
-    """
-    data = request.get_json(force=True)
-    q = (data.get("query") or "").strip()
-    if not q:
-        return jsonify({"error": "missing query"}), 400
-
-    enc = requests.utils.quote(q, safe="")
-    is_inchikey = re.match(r"^[A-Z]{14}-[A-Z]{10}-[A-Z]$", q, flags=re.I) is not None
-    is_cas      = re.match(r"^\d{2,7}-\d{2}-\d$", q) is not None
-
-    try:
-        # 1) InChIKey → SMILES
-        if is_inchikey:
-            js = _pc_json(f"{PUBCHEM}/compound/inchikey/{enc}/property/IsomericSMILES,CanonicalSMILES/JSON")
-            smi = _props_smiles_from_properties(js)
-            if smi: return jsonify({"smiles": smi})
-            return jsonify({"error": "no SMILES for that InChIKey"}), 404
-
-        # 2) CAS → (properties | CID → properties)
-        if is_cas:
-            try:
-                js = _pc_json(f"{PUBCHEM}/compound/xref/rn/{enc}/property/IsomericSMILES,CanonicalSMILES/JSON")
-                smi = _props_smiles_from_properties(js)
-                if smi: return jsonify({"smiles": smi})
-            except Exception:
-                pass
-            cj = _pc_json(f"{PUBCHEM}/compound/xref/rn/{enc}/cids/JSON")
-            cids = ((cj.get("IdentifierList") or {}).get("CID") or [])
-            if cids:
-                cid = cids[0]
-                pj = _pc_json(f"{PUBCHEM}/compound/cid/{cid}/property/IsomericSMILES,CanonicalSMILES/JSON")
-                smi = _props_smiles_from_properties(pj)
-                if smi: return jsonify({"smiles": smi})
-            return jsonify({"error": "no SMILES for that CAS"}), 404
-
-        # 3) Name → (properties | CID → properties)
-        try:
-            js = _pc_json(f"{PUBCHEM}/compound/name/{enc}/property/IsomericSMILES,CanonicalSMILES/JSON")
-            smi = _props_smiles_from_properties(js)
-            if smi: return jsonify({"smiles": smi})
-        except Exception:
-            pass
-
-        cj = _pc_json(f"{PUBCHEM}/compound/name/{enc}/cids/JSON")
-        cids = ((cj.get("IdentifierList") or {}).get("CID") or [])
-        if cids:
-            cid = cids[0]
-            pj = _pc_json(f"{PUBCHEM}/compound/cid/{cid}/property/IsomericSMILES,CanonicalSMILES/JSON")
-            smi = _props_smiles_from_properties(pj)
-            if smi: return jsonify({"smiles": smi})
-
-        return jsonify({"error": "could not resolve SMILES from that name"}), 404
-
-    except requests.HTTPError as e:
-        return jsonify({"error": f"HTTP {e.response.status_code} from PubChem"}), 502
-    except Exception as e:
-        return jsonify({"error": str(e)}), 400
-
+# --------- Core chemistry helpers ----------
 def gaussian_bond_order(bond) -> float:
     bt = bond.GetBondType()
     if bt == BondType.SINGLE:   return 1.0
@@ -118,14 +55,11 @@ def smiles_to_rdkit_with_H(smiles: str):
     return mol
 
 def embed_3d_inplace(mol):
-    # ETKDG + quick UFF relaxation
     AllChem.EmbedMolecule(mol, AllChem.ETKDG())
     AllChem.UFFOptimizeMolecule(mol)
     return mol
 
 def mol_to_sdf_text(mol) -> str:
-    # Make a temp writer to string
-    # (RDKit's SDWriter expects a file-like; use in-memory)
     from io import StringIO
     sio = StringIO()
     w = Chem.SDWriter(sio)
@@ -134,7 +68,6 @@ def mol_to_sdf_text(mol) -> str:
     return sio.getvalue()
 
 def build_connectivity_lines(mol) -> str:
-    # Symmetric neighbor listing with true bond orders
     lines = []
     nat = mol.GetNumAtoms()
     nbrs = {i: [] for i in range(nat)}
@@ -144,7 +77,6 @@ def build_connectivity_lines(mol) -> str:
         order = gaussian_bond_order(b)
         nbrs[i].append((j, order))
         nbrs[j].append((i, order))
-
     for i in range(nat):
         if not nbrs[i]:
             lines.append(f" {i+1}")
@@ -156,7 +88,6 @@ def build_connectivity_lines(mol) -> str:
     return "\n".join(lines) + "\n"
 
 def format_gaussian(mol, title: str, header: str, include_conn: bool = True) -> str:
-    # Coordinates
     conf = mol.GetConformer()
     coords = []
     for a in mol.GetAtoms():
@@ -164,7 +95,6 @@ def format_gaussian(mol, title: str, header: str, include_conn: bool = True) -> 
         pos = conf.GetAtomPosition(idx)
         coords.append((a.GetSymbol(), pos.x, pos.y, pos.z))
 
-    # Build text
     out = []
     if header:
         out.append(header.rstrip() + "\n\n")
@@ -177,14 +107,93 @@ def format_gaussian(mol, title: str, header: str, include_conn: bool = True) -> 
         out.append(build_connectivity_lines(mol))
     return "".join(out)
 
-@app.route("/api/smiles2sdf", methods=["POST"])
+# --------- Resolver: query (SMILES or Name/CAS/InChIKey) → SMILES ----------
+def resolve_query_to_smiles(q: str) -> str:
+    q = (q or "").strip()
+    if not q:
+        raise ValueError("missing query")
+
+    # 0) If it's valid SMILES already, canonicalize and return
+    try:
+        mol = Chem.MolFromSmiles(q)
+        if mol is not None:
+            return Chem.MolToSmiles(mol, isomericSmiles=True)
+    except Exception:
+        pass  # not SMILES, fall through
+
+    enc = requests.utils.quote(q, safe="")
+    is_inchikey = re.match(r"^[A-Z]{14}-[A-Z]{10}-[A-Z]$", q, flags=re.I) is not None
+    is_cas      = re.match(r"^\d{2,7}-\d{2}-\d$", q) is not None
+
+    # 1) InChIKey
+    if is_inchikey:
+        js = _pc_json(f"{PUBCHEM}/compound/inchikey/{enc}/property/IsomericSMILES,CanonicalSMILES/JSON")
+        smi = _props_smiles_from_properties(js)
+        if smi: return smi
+        raise ValueError("no SMILES for that InChIKey")
+
+    # 2) CAS RN
+    if is_cas:
+        try:
+            js = _pc_json(f"{PUBCHEM}/compound/xref/rn/{enc}/property/IsomericSMILES,CanonicalSMILES/JSON")
+            smi = _props_smiles_from_properties(js)
+            if smi: return smi
+        except Exception:
+            pass
+        cj = _pc_json(f"{PUBCHEM}/compound/xref/rn/{enc}/cids/JSON")
+        cids = ((cj.get("IdentifierList") or {}).get("CID") or [])
+        if cids:
+            cid = cids[0]
+            pj = _pc_json(f"{PUBCHEM}/compound/cid/{cid}/property/IsomericSMILES,CanonicalSMILES/JSON")
+            smi = _props_smiles_from_properties(pj)
+            if smi: return smi
+        raise ValueError("no SMILES for that CAS")
+
+    # 3) Name → property, else Name → CID → property
+    try:
+        js = _pc_json(f"{PUBCHEM}/compound/name/{enc}/property/IsomericSMILES,CanonicalSMILES/JSON")
+        smi = _props_smiles_from_properties(js)
+        if smi: return smi
+    except Exception:
+        pass
+
+    cj = _pc_json(f"{PUBCHEM}/compound/name/{enc}/cids/JSON")
+    cids = ((cj.get("IdentifierList") or {}).get("CID") or [])
+    if cids:
+        cid = cids[0]
+        pj = _pc_json(f"{PUBCHEM}/compound/cid/{cid}/property/IsomericSMILES,CanonicalSMILES/JSON")
+        smi = _props_smiles_from_properties(pj)
+        if smi: return smi
+
+    raise ValueError("could not resolve SMILES from that name")
+
+# --------- Routes ----------
+@app.route("/api/resolve_any", methods=["POST", "GET", "OPTIONS"])
+def api_resolve_any():
+    """
+    Resolve a query (SMILES or name/CAS/InChIKey) → SMILES
+      POST JSON: {"query": "..."}
+      GET  ?query=...
+    Returns: {"smiles": "..."} or 4xx on failure
+    """
+    try:
+        if request.method == "GET":
+            q = (request.args.get("query") or "").strip()
+        else:
+            data = request.get_json(force=True, silent=True) or {}
+            q = (data.get("query") or "").strip()
+        smi = resolve_query_to_smiles(q)
+        return jsonify({"smiles": smi})
+    except requests.HTTPError as e:
+        return jsonify({"error": f"HTTP {e.response.status_code} from PubChem"}), 502
+    except Exception as e:
+        print("resolve_any error:", repr(e))
+        return jsonify({"error": str(e)}), 404
+
+@app.post("/api/smiles2sdf")
 def api_smiles2sdf():
-    """
-    Input JSON: {"smiles": "..."}
-    Output: SDF text (3D, hydrogens added)
-    """
     data = request.get_json(force=True)
-    smiles = (data.get("smiles") or "").strip()
+    smiles = (data.get("smiles") or "").trim()
     if not smiles:
         return jsonify({"error": "Missing 'smiles'"}), 400
     try:
@@ -195,27 +204,15 @@ def api_smiles2sdf():
     except Exception as e:
         return jsonify({"error": str(e)}), 400
 
-@app.route("/api/gjf", methods=["POST"])
+@app.post("/api/gjf")
 def api_gjf():
-    """
-    Input JSON:
-      {
-        "smiles": "...",
-        "header": "%chk=<name>.chk\n# opt freq B3LYP/6-31G(d) geom=connectivity",
-        "title":  "C6H6 generated by ChemWeaver",
-        "include_connectivity": true
-      }
-    Output: plain text .gjf
-    """
     data = request.get_json(force=True)
     smiles = (data.get("smiles") or "").strip()
     if not smiles:
         return jsonify({"error": "Missing 'smiles'"}), 400
-
     header = data.get("header", "").strip()
     title  = data.get("title", smiles)
     include_conn = bool(data.get("include_connectivity", True))
-
     try:
         mol = smiles_to_rdkit_with_H(smiles)
         embed_3d_inplace(mol)
@@ -224,12 +221,9 @@ def api_gjf():
     except Exception as e:
         return jsonify({"error": str(e)}), 400
 
-@app.route("/")
+@app.get("/")
 def ok():
     return "ChemWeaver backend OK"
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000)
-
-
-
