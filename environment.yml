@@ -1,0 +1,8 @@
+name: chemweaver
+channels:
+  - conda-forge
+dependencies:
+  - python=3.10
+  - rdkit
+  - flask
+  - flask-cors
