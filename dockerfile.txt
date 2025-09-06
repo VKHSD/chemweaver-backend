@@ -1,0 +1,15 @@
+FROM condaforge/miniforge3:latest
+
+# Create the env with RDKit + Flask
+COPY environment.yml /tmp/environment.yml
+RUN conda env create -f /tmp/environment.yml && conda clean -afy
+SHELL ["conda", "run", "-n", "chemweaver", "/bin/bash", "-c"]
+
+WORKDIR /app
+COPY . /app
+
+# If your app.py listens on 0.0.0.0:5000, this is perfect
+EXPOSE 5000
+
+# Start Flask
+CMD ["conda", "run", "--no-capture-output", "-n", "chemweaver", "python", "app.py"]
