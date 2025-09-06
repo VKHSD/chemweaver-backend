@@ -15,12 +15,12 @@ import re
 import requests
 
 app = Flask(__name__)
-# Be liberal with CORS on /api/*
+# CORS for all API routes
 CORS(app, resources={r"/api/*": {"origins": "*"}})
 
 PUBCHEM = "https://pubchem.ncbi.nlm.nih.gov/rest/pug"
 
-# --------- PubChem helpers ----------
+# ----- PubChem helpers -----
 def _pc_json(url, timeout=10):
     r = requests.get(url, headers={"Accept": "application/json"}, timeout=timeout)
     r.raise_for_status()
@@ -38,7 +38,7 @@ def _props_smiles_from_properties(js):
     p = props[0]
     return p.get("IsomericSMILES") or p.get("CanonicalSMILES")
 
-# --------- Core chemistry helpers ----------
+# ----- Chemistry helpers -----
 def gaussian_bond_order(bond) -> float:
     bt = bond.GetBondType()
     if bt == BondType.SINGLE:   return 1.0
@@ -96,21 +96,20 @@ def format_gaussian(mol, title: str, header: str, include_conn: bool = True) -> 
     out.append(f"{title}\n\n")
     out.append("0 1\n")
     for a in mol.GetAtoms():
-        idx = a.GetIdx()
-        pos = conf.GetAtomPosition(idx)
+        pos = conf.GetAtomPosition(a.GetIdx())
         out.append(f" {a.GetSymbol():<2} {pos.x:>10.6f} {pos.y:>10.6f} {pos.z:>10.6f}\n")
     if include_conn:
         out.append("\n")
         out.append(build_connectivity_lines(mol))
     return "".join(out)
 
-# --------- Resolver: query (SMILES or Name/CAS/InChIKey) → SMILES ----------
+# ----- Resolver -----
 def resolve_query_to_smiles(q: str) -> str:
     q = (q or "").strip()
     if not q:
         raise ValueError("missing query")
 
-    # 0) Already SMILES?
+    # Already SMILES?
     try:
         mol = Chem.MolFromSmiles(q)
         if mol is not None:
@@ -162,33 +161,20 @@ def resolve_query_to_smiles(q: str) -> str:
 
     raise ValueError("could not resolve SMILES from that name")
 
-# --------- Routes ----------
-# Accept both with and without trailing slash, and allow GET to avoid preflight.
-# --------- Routes ----------
-# Accept GET/POST/OPTIONS and both with/without trailing slash
+# ----- Routes -----
 @app.route("/api/resolve_any", methods=["GET", "POST", "OPTIONS"], strict_slashes=False)
 @app.route("/api/resolve_any/", methods=["GET", "POST", "OPTIONS"], strict_slashes=False)
 def api_resolve_any():
-    """
-    Resolve a query (SMILES or name/CAS/InChIKey) → SMILES
-      GET  /api/resolve_any?query=...
-      POST /api/resolve_any    {"query":"..."}
-    Returns: {"smiles": "..."} or 4xx on failure
-    """
-    # Let Flask-CORS handle preflight, but return 200 explicitly too
     if request.method == "OPTIONS":
         return ("", 200)
-
     try:
         if request.method == "GET":
             q = (request.args.get("query") or "").strip()
-        else:  # POST
+        else:
             data = request.get_json(force=True, silent=True) or {}
             q = (data.get("query") or "").strip()
-
         if not q:
             return jsonify({"error": "missing query"}), 422
-
         smi = resolve_query_to_smiles(q)
         return jsonify({"smiles": smi})
     except requests.HTTPError as e:
@@ -197,11 +183,10 @@ def api_resolve_any():
         print("resolve_any error:", repr(e))
         return jsonify({"error": str(e)}), 404
 
-
 @app.post("/api/smiles2sdf")
 def api_smiles2sdf():
     data = request.get_json(force=True) or {}
-    smiles = (data.get("smiles") or "").strip()    # <-- strip() (fixes .trim bug)
+    smiles = (data.get("smiles") or "").strip()
     if not smiles:
         return jsonify({"error": "Missing 'smiles'"}), 400
     try:
@@ -235,4 +220,3 @@ def ok():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000)
-
