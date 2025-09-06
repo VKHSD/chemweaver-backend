@@ -15,12 +15,11 @@ import re
 import requests
 
 app = Flask(__name__)
-# CORS for all API routes
 CORS(app, resources={r"/api/*": {"origins": "*"}})
 
 PUBCHEM = "https://pubchem.ncbi.nlm.nih.gov/rest/pug"
 
-# ----- PubChem helpers -----
+# ---------- PubChem helpers ----------
 def _pc_json(url, timeout=10):
     r = requests.get(url, headers={"Accept": "application/json"}, timeout=timeout)
     r.raise_for_status()
@@ -38,7 +37,7 @@ def _props_smiles_from_properties(js):
     p = props[0]
     return p.get("IsomericSMILES") or p.get("CanonicalSMILES")
 
-# ----- Chemistry helpers -----
+# ---------- Chemistry helpers ----------
 def gaussian_bond_order(bond) -> float:
     bt = bond.GetBondType()
     if bt == BondType.SINGLE:   return 1.0
@@ -103,13 +102,13 @@ def format_gaussian(mol, title: str, header: str, include_conn: bool = True) -> 
         out.append(build_connectivity_lines(mol))
     return "".join(out)
 
-# ----- Resolver -----
+# ---------- Resolver ----------
 def resolve_query_to_smiles(q: str) -> str:
     q = (q or "").strip()
     if not q:
         raise ValueError("missing query")
 
-    # Already SMILES?
+    # 0) Already SMILES?
     try:
         mol = Chem.MolFromSmiles(q)
         if mol is not None:
@@ -121,12 +120,14 @@ def resolve_query_to_smiles(q: str) -> str:
     is_inchikey = re.match(r"^[A-Z]{14}-[A-Z]{10}-[A-Z]$", q, flags=re.I) is not None
     is_cas      = re.match(r"^\d{2,7}-\d{2}-\d$", q) is not None
 
+    # 1) InChIKey
     if is_inchikey:
         js = _pc_json(f"{PUBCHEM}/compound/inchikey/{enc}/property/IsomericSMILES,CanonicalSMILES/JSON")
         smi = _props_smiles_from_properties(js)
         if smi: return smi
         raise ValueError("no SMILES for that InChIKey")
 
+    # 2) CAS
     if is_cas:
         try:
             js = _pc_json(f"{PUBCHEM}/compound/xref/rn/{enc}/property/IsomericSMILES,CanonicalSMILES/JSON")
@@ -141,27 +142,43 @@ def resolve_query_to_smiles(q: str) -> str:
             pj = _pc_json(f"{PUBCHEM}/compound/cid/{cid}/property/IsomericSMILES,CanonicalSMILES/JSON")
             smi = _props_smiles_from_properties(pj)
             if smi: return smi
-        raise ValueError("no SMILES for that CAS")
+        # fall through to name + CACTUS
 
-    # Name
+    # 3) Name (PubChem)
     try:
         js = _pc_json(f"{PUBCHEM}/compound/name/{enc}/property/IsomericSMILES,CanonicalSMILES/JSON")
         smi = _props_smiles_from_properties(js)
         if smi: return smi
     except Exception:
         pass
+    try:
+        cj = _pc_json(f"{PUBCHEM}/compound/name/{enc}/cids/JSON")
+        cids = ((cj.get("IdentifierList") or {}).get("CID") or [])
+        if cids:
+            cid = cids[0]
+            pj = _pc_json(f"{PUBCHEM}/compound/cid/{cid}/property/IsomericSMILES,CanonicalSMILES/JSON")
+            smi = _props_smiles_from_properties(pj)
+            if smi: return smi
+    except Exception:
+        pass
 
-    cj = _pc_json(f"{PUBCHEM}/compound/name/{enc}/cids/JSON")
-    cids = ((cj.get("IdentifierList") or {}).get("CID") or [])
-    if cids:
-        cid = cids[0]
-        pj = _pc_json(f"{PUBCHEM}/compound/cid/{cid}/property/IsomericSMILES,CanonicalSMILES/JSON")
-        smi = _props_smiles_from_properties(pj)
-        if smi: return smi
+    # 4) CACTUS fallback
+    try:
+        r = requests.get(f"https://cactus.nci.nih.gov/chemical/structure/{enc}/smiles", timeout=10)
+        if r.ok:
+            smi = r.text.strip()
+            if smi:
+                # Canonicalize to keep downstream consistent
+                mol = Chem.MolFromSmiles(smi)
+                if mol is not None:
+                    return Chem.MolToSmiles(mol, isomericSmiles=True)
+                return smi
+    except Exception:
+        pass
 
     raise ValueError("could not resolve SMILES from that name")
 
-# ----- Routes -----
+# ---------- Routes ----------
 @app.route("/api/resolve_any", methods=["GET", "POST", "OPTIONS"], strict_slashes=False)
 @app.route("/api/resolve_any/", methods=["GET", "POST", "OPTIONS"], strict_slashes=False)
 def api_resolve_any():
